@@ -1,0 +1,24 @@
+MMIO Write/Read access dumper
+      
+This library will intercept mmap call (libc) and check if the process
+is trying to mmap the address you provide in environement variable SF_ADDR.
+If it intercept such a call it will mmap and protect the area against
+read/write.
+
+In the meantime a signal handler for SIGSEGV is installed. Thus any attempt
+to read or write the mapped and protected area will call the signal handler.
+The signal handler then disassemble the instruction responsible for the
+segmentation fault and try to emulate instruction (WARNING supporting only
+mov right now other instruction might blow up the universe). And log the
+operation in file (SF_LOGFILE environnement variable or stderr).
+
+If it detects unsupported instruction i will unprotect the area and resume
+the program execution but this may fail (and will according to murphy law).
+
+WARNING this are highly experimental and should be use with care.
+Thus run sync three times to honour coders of old ;).
+
+As a side note just use stderr if you want to log things with Xorg, or
+you will get a corrupted log.
+
+Jerome Glisse
