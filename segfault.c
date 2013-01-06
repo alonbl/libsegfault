@@ -127,6 +127,8 @@ static void* (* o_mmap)(
 	off_t off
 );
 
+static void* libc_handle = NULL;
+
 
 /*
  * static variables used for immediate value
@@ -392,14 +394,18 @@ static void segfault_init(void)
 	struct sigaction action = {{0}};
 	struct sigaction trap_action = {{0}};
 
+	if ( (libc_handle = dlopen("libc.so", RTLD_NOW)) == NULL)
+		if ( (libc_handle = dlopen("libc.so.6", RTLD_NOW)) == NULL)
+			fprintf(stderr, "error loading libc!");
+
 	/* get the address of the original signal() -function in libc */
-	REPLACE(NULL, signal, "signal");
+	REPLACE(libc_handle, signal, "signal");
 
 	/* get the address of the original sigaction() -function in libc */
-	REPLACE(NULL, sigaction, "sigaction");
+	REPLACE(libc_handle, sigaction, "sigaction");
 
 	/* get the address of the original mmap() -function in libc */
-	REPLACE(NULL, mmap, "mmap");
+	REPLACE(libc_handle, mmap, "mmap");
 
 	/* redirect action for these signals to our functions */
 	action.sa_flags = SA_SIGINFO;
