@@ -279,7 +279,7 @@ static int set_breakpoint(uint8_t *ptr)
 	/* FIXME: change the premisstions back to the orginal */
 	result = mprotect(
 		(void*)((unsigned int)context.inst_addr & 0xfffff000),
-		context.size,
+		getpagesize(),
 		PROT_READ | PROT_WRITE | PROT_EXEC
 	);
 	if (result < 0) {
@@ -323,8 +323,8 @@ static void trap_handler(int sig, siginfo_t *info, void *signal_ucontext)
 	}
 
 	/* remove the breakpoint */
-	*(uint8_t*)(INST_PTR((ucontext_t*)(signal_ucontext))) = context.inst_part;
-
+	*context.inst_addr = context.inst_part;
+    INST_PTR((ucontext_t*)(signal_ucontext))--;
 	fprintf(context.log, "value after : 0x%x\n", *context.fault_addr);
 	protect();
 }
