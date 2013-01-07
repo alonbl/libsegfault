@@ -51,6 +51,8 @@
 #include <ucontext.h>
 #include <udis86.h>
 
+#define MAX_NUM_OF_MAPS 13
+
 /* Debug stuff */
 #ifdef DEBUG
 #define DEBUGF(format, ...) \
@@ -80,37 +82,36 @@
 #error unsupported architecture
 #endif
 
-/* Operand of memory transaction (only handling byte, word, dword access) */
-enum operand_type {
-	transaction_byte = 0,
-	transaction_word,
-	transaction_dword,
-	transaction_sbyte,
-	transaction_sword,
-	transaction_sdword,
-};
 
 typedef struct {
-	void *address;
-	enum operand_type type;
-} operand_t;
-
-/* Structure storing everythings we need to know */
-typedef struct {
-	ud_t disasm;
 	void *mmap_addr;
 	void *addr;
 	size_t size;
 	unsigned long saddr;
 	unsigned long eaddr;
+} map_t;
+
+/* Structure storing everythings we need to know */
+typedef struct {
+	ud_t disasm;
 	int protected;
 	FILE *log;
 	ucontext_t *context;
 	uint8_t *inst_addr;
 	uint8_t inst_part;
 	ADDR_TYPE *fault_addr;
+
+    map_t maps[MAX_NUM_OF_MAPS];
+    map_t *current_map;
+    long map_count;
+
 } segfault_t;
 
+typedef enum error_e {
+    SUCCESS = 0,
+    ADDR_NOT_FOUND,
+    TOO_MANY_MAPS
+} error_t;
 /*
  * o_signal is a ptr to original libc signal handler
  * o_mmap is a ptr to original libc mmap function
@@ -138,20 +139,52 @@ static long signed_constant;
 static unsigned long unsigned_constant;
 
 /*
+ * That's all folks in case of fatal error or unhandled instruction thus no
+ * bad things happen.
+ */
+static void thats_all_folks(void)
+{
+	fprintf(context.log, "That's all folks !\n");
+    exit(-1);
+}
+
+static error_t add_map()
+{
+    if (MAX_NUM_OF_MAPS <= context.map_count) {
+        return TOO_MANY_MAPS;
+    }
+    context.map_count++;
+    context.current_map = &context.maps[context.map_count];
+
+    return SUCCESS;
+}
+
+static error_t set_map_context(ADDR_TYPE addr)
+{
+    long i = 0;
+    for (; i < MAX_NUM_OF_MAPS; i++) {
+        if ((context.maps[i].saddr <= addr) &&
+            (context.maps[i].eaddr >= addr)) {
+            context.current_map = &context.maps[i];
+            return SUCCESS;
+        }
+    }
+    return ADDR_NOT_FOUND;
+}
+
+/*
  * Protect memory
  */
 static void protect(void)
 {
-	if (context.protected) {
-		if (mprotect(context.addr, context.size, PROT_NONE) < 0) {
-			fprintf(
-				context.log,
-				"mprotect(0x%08X|0x%08X) failed\n", 
-				(unsigned int)context.addr,
-				context.size
-			);
-			exit(1);
-		}
+	if (mprotect(context.current_map->addr, context.current_map->size, PROT_NONE) < 0) {
+		fprintf(
+			context.log,
+			"mprotect(0x%08X|0x%08X) failed\n", 
+			(unsigned int)context.current_map->addr,
+			context.current_map->size
+		);
+		exit(1);
 	}
 }
 
@@ -160,16 +193,14 @@ static void protect(void)
  */
 static void unprotect(void)
 {
-	if (context.protected) {
-		if (mprotect(context.addr, context.size, PROT_READ | PROT_WRITE) < 0) {
-			fprintf(
-				context.log,
-				"mprotect(0x%08X|0x%08X) failed\n", 
-				(unsigned int)context.addr,
-				context.size
-			);
-			exit(1);
-		}
+	if (mprotect(context.current_map->addr, context.current_map->size, PROT_READ | PROT_WRITE) < 0) {
+		fprintf(
+			context.log,
+			"mprotect(0x%08X|0x%08X) failed\n", 
+			(unsigned int)context.current_map->addr,
+			context.current_map->size
+		);
+		exit(1);
 	}
 }
 
@@ -178,22 +209,22 @@ static void unprotect(void)
  */
 void libsegfault_protect(void* addr, size_t size, FILE* log)
 {
-	context.addr = addr;
-	context.size = size;
-	context.saddr = (unsigned long)context.addr;
-	context.eaddr = (unsigned long)context.addr + context.size;
+	context.current_map->addr = addr;
+	context.current_map->size = size;
+	context.current_map->saddr = (unsigned long)context.current_map->addr;
+	context.current_map->eaddr = (unsigned long)context.current_map->addr + context.current_map->size;
 	context.log = log;
 	context.protected = 1;
 	protect();
 	DEBUGF(
 		"protecting 0x%08X of lenght 0x%08X)\n",
-		(unsigned int)context.addr,
-		context.size
+		(unsigned int)context.current_map->addr,
+		context.current_map->size
 	);
 	DEBUGF(
 		"protecting 0x%08lX up to 0x%08lX)\n",
-		context.saddr,
-		context.eaddr
+		context.current_map->saddr,
+		context.current_map->eaddr
 	);
 }
 
@@ -202,6 +233,14 @@ void libsegfault_protect(void* addr, size_t size, FILE* log)
  */
 void *mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off)
 {
+    error_t status = SUCCESS;
+
+    /* add another map to the maping list */
+    status = add_map();
+    if (SUCCESS != status) {
+        thats_all_folks();
+    }
+
 	DEBUGF(
 		"intercepting mmap(0x%08X, 0x%08X, %d, %d, %d, 0x%08lX)\n",
 		(unsigned int)addr,
@@ -211,9 +250,8 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off)
 		fildes,
 		off
 	);
-	if (off == (off_t)context.mmap_addr) {
-		context.size = len;
-		context.addr = o_mmap(
+		context.current_map->size = len;
+		context.current_map->addr = o_mmap(
 			addr,
 			len,
 			PROT_NONE,
@@ -221,24 +259,35 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off)
 			fildes,
 			off
 		);
-		context.saddr = (unsigned long)context.addr;
-		context.eaddr = (unsigned long)context.addr + context.size;
-		context.protected = 1;
+		context.current_map->saddr = (unsigned long)context.current_map->addr;
+		context.current_map->eaddr = (unsigned long)context.current_map->addr + context.current_map->size;
 		printf("intercepting mmap initialize\n");
 		DEBUGF(
-			"mmap protecting 0x%08X at 0x%08X of lenght 0x%08X)\n",
-			(unsigned int)context.mmap_addr,
-			(unsigned int)context.addr,
-			context.size
+			"mmap protecting  0x%08X of lenght 0x%08X)\n",
+			(unsigned int)context.current_map->addr,
+			context.current_map->size
 		);
 		DEBUGF(
 			"protecting 0x%08lX up to 0x%08lX)\n",
-			context.saddr,
-			context.eaddr
+			context.current_map->saddr,
+			context.current_map->eaddr
 		);
-		return context.addr;
-	}
-	return o_mmap(addr, len, prot, flags, fildes, off);
+		return context.current_map->addr;
+}
+
+/*
+ * Replace the libc sigaction function
+ */
+int sigaction(int sn,const struct sigaction *act, struct sigaction *oldact)
+{
+    if (SIGSEGV == sn) {
+        return 0;
+    }
+    if (SIGTRAP == sn) {
+        return 0;
+    }
+
+    return o_sigaction(sn, act, oldact);
 }
 
 /*
@@ -262,15 +311,6 @@ void (*signal(int sn, void (*sighandler)(int)))()
 
 /* TODO: make a stub for sigaction also */
 
-/*
- * That's all folks in case of fatal error or unhandled instruction thus no
- * bad things happen.
- */
-static void thats_all_folks(void)
-{
-	fprintf(context.log, "That's all folks !\n");
-	unprotect();
-}
 
 static int set_breakpoint(uint8_t *ptr)
 {
@@ -288,8 +328,8 @@ static int set_breakpoint(uint8_t *ptr)
 		fprintf(
 			context.log,
 			"mprotect(0x%08X|0x%08X) failed\n", 
-			(unsigned int)context.addr,
-			context.size
+			(unsigned int)context.current_map->addr,
+			context.current_map->size
 		);
 		goto l_exit;
 	}
@@ -339,15 +379,22 @@ static void segfault_handler(int sig, siginfo_t *info, void *signal_ucontext)
 	int instruction_size = 0;
 	uint8_t* opcode = NULL;
 	int result = 0;
+    error_t status = SUCCESS;
 
 	if (NULL == signal_ucontext) {
 		thats_all_folks();
-		goto l_exit;
 	}
+
 
 	/* get the signal frame from the ucontext */
 	context.context = (ucontext_t*)(signal_ucontext);
 	context.fault_addr = info->si_addr;
+
+    /* a bit hacky please FIXME */
+    status = set_map_context(context.fault_addr);
+    if (SUCCESS != status) {
+        thats_all_folks();
+    }
 
 	fprintf(context.log, "fault addr: 0x%x\n", (unsigned int)context.fault_addr);
 
@@ -422,14 +469,7 @@ static void segfault_init(void)
 		context.log = stderr;
 	}
 
-	if (getenv("SF_ADDR")) {
-		sscanf(
-			getenv("SF_ADDR"),
-			"%lx",
-			(unsigned long*)&context.mmap_addr
-		);
-		printf("addr : %s\n", getenv("SF_ADDR"));
-	}
+
 
 	/* init the disassmbler (udis86) */
 	ud_init(&(context.disasm));
