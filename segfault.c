@@ -82,6 +82,7 @@
 #error unsupported architecture
 #endif
 
+#define page_align(address)  (char*)((unsigned long)(address) & -(getpagesize()))
 
 typedef struct {
 	void *mmap_addr;
@@ -102,7 +103,6 @@ typedef struct {
 	ADDR_TYPE *fault_addr;
 
     map_t maps[MAX_NUM_OF_MAPS];
-    map_t *current_map;
     long map_count;
 
 } segfault_t;
@@ -110,7 +110,8 @@ typedef struct {
 typedef enum error_e {
     SUCCESS = 0,
     ADDR_NOT_FOUND,
-    TOO_MANY_MAPS
+    TOO_MANY_MAPS,
+    MPROTECT_FAILD
 } error_t;
 /*
  * o_signal is a ptr to original libc signal handler
@@ -135,8 +136,6 @@ static void* libc_handle = NULL;
  * static variables used for immediate value
  */
 static segfault_t context;
-static long signed_constant;
-static unsigned long unsigned_constant;
 
 /*
  * That's all folks in case of fatal error or unhandled instruction thus no
@@ -148,24 +147,25 @@ static void thats_all_folks(void)
     exit(-1);
 }
 
-static error_t add_map()
+static error_t add_map(map_t **map)
 {
     if (MAX_NUM_OF_MAPS <= context.map_count) {
         return TOO_MANY_MAPS;
     }
+
     context.map_count++;
-    context.current_map = &context.maps[context.map_count];
+    *map = &context.maps[context.map_count];
 
     return SUCCESS;
 }
 
-static error_t set_map_context(ADDR_TYPE addr)
+static error_t find_map(ADDR_TYPE addr, map_t **map)
 {
     long i = 0;
     for (; i < MAX_NUM_OF_MAPS; i++) {
         if ((context.maps[i].saddr <= addr) &&
             (context.maps[i].eaddr >= addr)) {
-            context.current_map = &context.maps[i];
+            *map = &context.maps[i];
             return SUCCESS;
         }
     }
@@ -175,14 +175,14 @@ static error_t set_map_context(ADDR_TYPE addr)
 /*
  * Protect memory
  */
-static void protect(void)
+static void protect(map_t *map)
 {
-	if (mprotect(context.current_map->addr, context.current_map->size, PROT_NONE) < 0) {
+	if (mprotect(map->addr, map->size, PROT_NONE) < 0) {
 		fprintf(
 			context.log,
 			"mprotect(0x%08X|0x%08X) failed\n", 
-			(unsigned int)context.current_map->addr,
-			context.current_map->size
+			(unsigned int)map->addr,
+			map->size
 		);
 		exit(1);
 	}
@@ -191,14 +191,14 @@ static void protect(void)
 /*
  * Unprotect memory
  */
-static void unprotect(void)
+static void unprotect(map_t *map)
 {
-	if (mprotect(context.current_map->addr, context.current_map->size, PROT_READ | PROT_WRITE) < 0) {
+	if (mprotect(map->addr, map->size, PROT_READ | PROT_WRITE) < 0) {
 		fprintf(
 			context.log,
 			"mprotect(0x%08X|0x%08X) failed\n", 
-			(unsigned int)context.current_map->addr,
-			context.current_map->size
+			(unsigned int)map->addr,
+			map->size
 		);
 		exit(1);
 	}
@@ -209,22 +209,30 @@ static void unprotect(void)
  */
 void libsegfault_protect(void* addr, size_t size, FILE* log)
 {
-	context.current_map->addr = addr;
-	context.current_map->size = size;
-	context.current_map->saddr = (unsigned long)context.current_map->addr;
-	context.current_map->eaddr = (unsigned long)context.current_map->addr + context.current_map->size;
+    map_t *map = NULL;
+    error_t status = SUCCESS;
+
+    /* add another map to the maping list */
+    status = add_map(&map);
+    if (SUCCESS != status) {
+        return; /* FIXME: add a status code return */
+    }
+
+	map->addr = addr;
+	map->size = size;
+	map->saddr = (unsigned long)map->addr;
+	map->eaddr = (unsigned long)map->addr + map->size;
 	context.log = log;
-	context.protected = 1;
-	protect();
+	protect(map);
 	DEBUGF(
 		"protecting 0x%08X of lenght 0x%08X)\n",
-		(unsigned int)context.current_map->addr,
-		context.current_map->size
+		(unsigned int)map->addr,
+		map->size
 	);
 	DEBUGF(
 		"protecting 0x%08lX up to 0x%08lX)\n",
-		context.current_map->saddr,
-		context.current_map->eaddr
+		map->saddr,
+		map->eaddr
 	);
 }
 
@@ -233,10 +241,11 @@ void libsegfault_protect(void* addr, size_t size, FILE* log)
  */
 void *mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off)
 {
+    map_t *map = NULL;
     error_t status = SUCCESS;
 
     /* add another map to the maping list */
-    status = add_map();
+    status = add_map(&map);
     if (SUCCESS != status) {
         thats_all_folks();
     }
@@ -250,8 +259,8 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off)
 		fildes,
 		off
 	);
-		context.current_map->size = len;
-		context.current_map->addr = o_mmap(
+		map->size = len;
+		map->addr = o_mmap(
 			addr,
 			len,
 			PROT_NONE,
@@ -259,20 +268,20 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off)
 			fildes,
 			off
 		);
-		context.current_map->saddr = (unsigned long)context.current_map->addr;
-		context.current_map->eaddr = (unsigned long)context.current_map->addr + context.current_map->size;
+		map->saddr = (unsigned long)map->addr;
+		map->eaddr = (unsigned long)map->addr + map->size;
 		printf("intercepting mmap initialize\n");
 		DEBUGF(
 			"mmap protecting  0x%08X of lenght 0x%08X)\n",
-			(unsigned int)context.current_map->addr,
-			context.current_map->size
+			(unsigned int)map->addr,
+			map->size
 		);
 		DEBUGF(
 			"protecting 0x%08lX up to 0x%08lX)\n",
-			context.current_map->saddr,
-			context.current_map->eaddr
+			map->saddr,
+			map->eaddr
 		);
-		return context.current_map->addr;
+		return map->addr;
 }
 
 /*
@@ -312,24 +321,24 @@ void (*signal(int sn, void (*sighandler)(int)))()
 /* TODO: make a stub for sigaction also */
 
 
-static int set_breakpoint(uint8_t *ptr)
+static error_t set_breakpoint(uint8_t *ptr)
 {
 	int result = 0;
+    error_t status = SUCCESS;
 
 	context.inst_addr = ptr;
 	context.inst_part = *ptr;
 	/* FIXME: change the premisstions back to the orginal */
 	result = mprotect(
-		(void*)((unsigned int)context.inst_addr & 0xfffff000),
+		(void*)(page_align((unsigned int)context.inst_addr)),
 		getpagesize(),
 		PROT_READ | PROT_WRITE | PROT_EXEC
 	);
 	if (result < 0) {
+        status = MPROTECT_FAILD;
 		fprintf(
 			context.log,
-			"mprotect(0x%08X|0x%08X) failed\n", 
-			(unsigned int)context.current_map->addr,
-			context.current_map->size
+			"set_breakpoint mprotect failed\n"
 		);
 		goto l_exit;
 	}
@@ -338,7 +347,7 @@ static int set_breakpoint(uint8_t *ptr)
 	*ptr = BREAKPOINT;
 
 l_exit:
-	return result;
+	return status;
 }
 
 /*
@@ -359,16 +368,24 @@ static int process_opcode(uint8_t* opcode)
 /* FIXME: can create starvetion? */
 static void trap_handler(int sig, siginfo_t *info, void *signal_ucontext)
 {
+    map_t *map = NULL;
+    error_t status = SUCCESS;
+
 	/* TODO: check the si_code */
 	if ((context.inst_addr+1) != (void*)INST_PTR((ucontext_t*)(signal_ucontext))) {
 		return;
 	}
 
+    status = find_map(context.fault_addr, &map);
+    if (SUCCESS != status) {
+        thats_all_folks();
+    }
+
 	/* remove the breakpoint */
 	*context.inst_addr = context.inst_part;
     INST_PTR((ucontext_t*)(signal_ucontext))--;
 	fprintf(context.log, "value after : 0x%x\n", *context.fault_addr);
-	protect();
+	protect(map);
 }
 
 /*
@@ -379,6 +396,7 @@ static void segfault_handler(int sig, siginfo_t *info, void *signal_ucontext)
 	int instruction_size = 0;
 	uint8_t* opcode = NULL;
 	int result = 0;
+    map_t *map = NULL;
     error_t status = SUCCESS;
 
 	if (NULL == signal_ucontext) {
@@ -390,8 +408,7 @@ static void segfault_handler(int sig, siginfo_t *info, void *signal_ucontext)
 	context.context = (ucontext_t*)(signal_ucontext);
 	context.fault_addr = info->si_addr;
 
-    /* a bit hacky please FIXME */
-    status = set_map_context(context.fault_addr);
+    status = find_map(context.fault_addr, &map);
     if (SUCCESS != status) {
         thats_all_folks();
     }
@@ -410,15 +427,15 @@ static void segfault_handler(int sig, siginfo_t *info, void *signal_ucontext)
 
 	/* set a breakpoint after the instruction */
 	opcode += instruction_size;
-	result = set_breakpoint(opcode);
-	if (0 != result) {
+	status = set_breakpoint(opcode);
+	if (SUCCESS != status) {
 		thats_all_folks();
 		goto l_exit;
 	}
 
 	/* unprotect do the instruction 
 	* we will return the protection at SIGTAP hanlder */
-	unprotect();
+	unprotect(map);
 
 	fprintf(context.log, "value before : 0x%x\n", *context.fault_addr);
 
