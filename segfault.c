@@ -44,6 +44,7 @@
 #include <ucontext.h>
 #include <udis86.h>
 #include <execinfo.h>
+#include <errno.h>
 
 #define MAX_NUM_OF_MAPS 13
 #define MAX_NUM_OF_BREAKS 13
@@ -512,7 +513,7 @@ set_breakpoint(
 
 	/* FIXME: change the premisstions back to the orginal */
 	result = mprotect(
-		(void*)(page_align((unsigned int)_breakpoint->inst_addr)),
+		(void*)(page_align(_breakpoint->inst_addr)),
 		getpagesize(),
 		PROT_READ | PROT_WRITE | PROT_EXEC
 	);
@@ -520,7 +521,8 @@ set_breakpoint(
         status = SEGFAULT_MPROTECT_FAILD;
 		fprintf(
 			context.log,
-			"set_breakpoint mprotect failed\n"
+			"set_breakpoint mprotect failed errno:%d\n",
+            errno
 		);
 		goto l_exit;
 	}
